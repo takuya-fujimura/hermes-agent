@@ -580,6 +580,32 @@ class TestMemoryBatch:
         assert store.memory_entries.count("already here") == 1
         assert "brand new" in store.memory_entries
 
+    def test_batch_with_non_dict_entry_is_rejected_not_crashed(self, store):
+        # An unparseable array string is wrapped as a one-string list by
+        # coerce_tool_args, and a loose provider can emit a bare string entry.
+        # The call must return an actionable error and leave the store untouched.
+        operations = json.loads('["remove", {"action": "add", "content": "never written"}]')
+        result = json.loads(memory_tool(target="memory", operations=operations, store=store))
+        assert result["success"] is False
+        assert "operations entries must" in result["error"]
+        assert "never written" not in store.memory_entries
+
+    def test_batch_with_none_entry_is_rejected_not_crashed(self, store):
+        operations = json.loads('[null, {"action": "add", "content": "also never written"}]')
+        result = json.loads(memory_tool(target="memory", operations=operations, store=store))
+        assert result["success"] is False
+        assert "operations entries must" in result["error"]
+        assert "also never written" not in store.memory_entries
+
+    def test_store_apply_batch_rejects_non_dict_entry_directly(self, store):
+        # The staged approval replay reaches store.apply_batch past the tool entry point.
+        result = store.apply_batch(
+            "memory", json.loads('["remove", {"action": "add", "content": "never written"}]')
+        )
+        assert result["success"] is False
+        assert "operations entries must" in result["error"]
+        assert "never written" not in store.memory_entries
+
     def test_batch_injection_blocked_rejects_whole_batch(self, store):
         result = json.loads(memory_tool(
             target="memory",
