@@ -26,7 +26,11 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_worker_exit import (
+    _EXIT_TRAILER_RE,
+    _exit_code_kind,
+    _worker_log_exit_code,
+)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -144,7 +148,7 @@ class DispatchResult:
     a failure — a long quota window must never trip the circuit breaker."""
     owner_lost: list[str] = field(default_factory=list)
     """Task ids whose workers exhausted their owner wait during a gateway
-    restart (EX_PROTOCOL sentinel exit) and were released to ``ready`` WITHOUT
+    restart (EX_PROTOCOL sentinel exit): released to ``ready`` WITHOUT
     counting a failure — a restart's silence is the host's, not the card's."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
@@ -245,40 +249,6 @@ def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     if signal_number != 0x7F:
         return ("signaled", signal_number)
     return ("unknown", None)
-
-
-def _exit_code_kind(code: int) -> tuple[str, int]:
-    """``(kind, code)`` for a worker's exit code, however it was observed."""
-    if code == 0:
-        return ("clean_exit", 0)
-    if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
-        return ("rate_limited", code)
-    if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
-        return ("terminal_provider", code)
-    if code == _kb.KANBAN_OWNER_LOST_EXIT_CODE:
-        return ("owner_lost", code)
-    return ("nonzero_exit", code)
-
-
-_EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
-)
-
-
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
-
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
 
 
 def reap_worker_zombies() -> list[int]:
@@ -1133,10 +1103,9 @@ def _classify_dead_worker_exit(
             rate_limited=True,
         )
     if kind == "owner_lost":
-        # The worker waited out its whole restart budget and left cleanly: the owner's
-        # silence is the host's condition, not the card's. Release to the source phase
-        # and do NOT count a failure, like a quota wall — the breaker must never trip
-        # on a gateway restart.
+        # The worker waited out its whole restart budget and left cleanly: the owner's silence
+        # is the host's condition, not the card's. Release WITHOUT a failure, like a quota
+        # wall — the breaker must never trip on a gateway restart.
         return _DeadWorker(
             kind, code,
             f"pid {pid} exhausted its owner wait during a gateway restart (exit {code}) — "
@@ -1251,9 +1220,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message. An
-                # owner-lost requeue stamps the restart silence for the same
-                # reason: the retry worker must know the owner restarted, not
-                # that the card failed.
+                # owner-lost requeue stamps the restart silence the same way.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),

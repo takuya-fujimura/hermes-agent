@@ -314,10 +314,8 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
-# Worker exit "the owner never came back": the worker waited out its whole restart budget and
-# left cleanly. The owner's silence is the host's condition, not the card's, so the dispatcher
-# requeues WITHOUT counting a failure — the breaker must never trip on a gateway restart.
-# 76 == BSD EX_PROTOCOL: the owner conversation ended without an answer.
+# Worker exit "the owner never came back": the whole restart budget spent, a clean leave. The
+# silence is the host's, not the card's — requeued WITHOUT a failure. 76 == BSD EX_PROTOCOL.
 KANBAN_OWNER_LOST_EXIT_CODE = 76
 
 
