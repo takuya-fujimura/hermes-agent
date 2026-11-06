@@ -22,6 +22,11 @@ from typing import Optional
 # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
 # gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
 OWNER_WAIT_S = 180.0
+# A restart's silence outlives that wait: the owner drains (its after-turn wait), stops, and its
+# replacement installs and starts. While the owner kept saying it is restarting within this wait,
+# the budget is the restart wait — one full update — instead of ``OWNER_WAIT_S``, whose expiry
+# mid-restart ends every in-flight card at once.
+OWNER_RESTART_WAIT_S = 600.0
 _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
 # retired authority's successor holds the admission the next connection reads.
@@ -65,9 +70,11 @@ async def run(params, board_db):
     # A lost socket is not a lost attempt, and exiting here would let ``_watch_submitter`` end the
     # owner's in-flight turn, so the next connection resumes whatever the last one reached. The
     # wait is bounded from the owner's last answer: an owner that keeps answering keeps the
-    # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
+    # worker, and one that stays silent past its budget — the restart's while it keeps saying it
+    # is restarting, the plain one otherwise — fails the worker honestly.
     claim = _Claim(answered=time.monotonic())
     failures = 0
+    restart_seen = None
     while True:
         seen = claim.answered
         try:
@@ -89,7 +96,9 @@ async def run(params, board_db):
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
             if not _restartable(exc):
                 raise
-            if claim.silent_for() >= OWNER_WAIT_S:
+            if _restart_verdict(exc):
+                restart_seen = time.monotonic()
+            if claim.silent_for() >= _silence_budget(restart_seen):
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
@@ -106,11 +115,28 @@ async def run(params, board_db):
 def _restartable(exc):
     """False when *exc* is the owner's own final answer; True for a restarting owner or a lost transport."""
     from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
+    if isinstance(exc, (GatewayRPCError, GatewayUnavailableError)):
+        return _restart_verdict(exc)
+    return True
+
+
+def _restart_verdict(exc):
+    """True when *exc* is the owner itself saying it is restarting — a draining or starting
+    verdict, a retired authority, or a reset control answer. A bare lost transport is not one:
+    an owner gone without a word gets the plain budget, not the restart's."""
+    from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
     if isinstance(exc, GatewayRPCError):
         return str(exc) in _TRANSIENT_RPC_REASONS
     if isinstance(exc, GatewayUnavailableError):
         return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
-    return True
+    return False
+
+
+def _silence_budget(restart_seen):
+    """``OWNER_RESTART_WAIT_S`` while a restart verdict was seen within this wait, else ``OWNER_WAIT_S``."""
+    if restart_seen is None or time.monotonic() - restart_seen > OWNER_RESTART_WAIT_S:
+        return OWNER_WAIT_S
+    return OWNER_RESTART_WAIT_S
 
 
 async def _discard(events):

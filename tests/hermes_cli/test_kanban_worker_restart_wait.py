@@ -102,11 +102,102 @@ async def test_a_worker_cut_by_a_restart_wait_waits_outside_it(monkeypatch, tmp_
     monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
 
     # The worker waits for the next owner without reading anything from the restarting one, and an
-    # owner that never comes back still fails it at OWNER_WAIT_S (which ends the turn it held).
+    # owner that never comes back still fails it once its budget runs out — the restart's while
+    # the wait keeps refusing it, the plain one otherwise.
     with pytest.raises(gateway_client.GatewayClientError, match="owner silent"):
         await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
     assert owner.receipts_in_wait == 0
     assert owner.dials > 2
+
+
+class _RevivingOwner:
+    """The restart, end to end: the first connection is admitted and cut, every dial until
+    ``revive_after`` is refused by the restart wait, and the next dial is the replacement
+    owner, whose receipt is final."""
+
+    def __init__(self, revive_after):
+        self.dials = 0
+        self.revive_after = revive_after
+
+    def connect(self):
+        owner = self
+
+        @asynccontextmanager
+        async def _connect(*_, **__):
+            owner.dials += 1
+            if 1 < owner.dials <= owner.revive_after:
+                raise GUE(f"Gateway draining: {RESTART_WAIT_REASON}", "draining", RESTART_WAIT_REASON)
+
+            class _Client:
+                events = asyncio.Queue()
+
+                async def rpc(self, method, **params):
+                    if method == "kanban.run":
+                        return {"session_id": "s1", "receipt": {"status": "pending", "admission_id": "a1"}}
+                    if owner.dials == 1:
+                        raise gateway_client.GatewayClientError("Gateway disconnected; turn outcome is unknown")
+                    return {"status": "terminal"}
+
+            yield _Client()
+
+        return _connect
+
+
+def _steady_clock(monkeypatch):
+    """Fake monotonic time advanced by every wait, and a deterministic 1 s backoff: dial N
+    happens at second N-1, so refusal windows and budgets are exact."""
+    clock = [0.0]
+    monkeypatch.setattr(kanban_worker_client, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    async def _sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _sleep)
+    from agent import retry_utils
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda failures, **_: 1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_that_never_clears_holds_the_worker_for_the_restart_wait(monkeypatch, tmp_path):
+    # On main the draining verdicts bought only OWNER_WAIT_S: the worker gave up ~181 s into a
+    # restart whose drain, install and start run longer — the mass card loss. While the owner
+    # keeps saying it is restarting, the restart wait is the budget.
+    _steady_clock(monkeypatch)
+    owner = _RevivingOwner(10 ** 6)
+    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+
+    with pytest.raises(gateway_client.GatewayClientError, match="owner silent for 600s"):
+        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
+
+
+@pytest.mark.asyncio
+async def test_a_worker_cut_by_a_long_restart_resumes_when_the_replacement_owner_answers(monkeypatch, tmp_path):
+    # The blackout outlives OWNER_WAIT_S: drain verdicts until the replacement owner is up, then
+    # the same attempt settles on it. On main the worker gave up at ~181 s — before this owner
+    # existed — and the card died a crash.
+    _steady_clock(monkeypatch)
+    monkeypatch.setattr("gateway.session_kanban.worker_result", lambda *_, **__: {"exit_code": 0})
+    owner = _RevivingOwner(300)  # the replacement owner first answers at t=301 s
+    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+
+    rc = await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
+    assert rc == 0
+    assert owner.dials > 300  # the revival dial, past the plain budget's 180 s grave
+
+
+@pytest.mark.asyncio
+async def test_silence_without_a_restart_verdict_keeps_the_plain_wait(monkeypatch, tmp_path):
+    # An owner gone without a word — no draining verdict, no reset answer — gets the plain
+    # budget: the restart wait is for restarts, not for an owner that never came back.
+    _steady_clock(monkeypatch)
+
+    @asynccontextmanager
+    async def _gone(*_, **__):
+        raise OSError("connection refused")
+        yield
+    monkeypatch.setattr(gateway_client, "connect_gateway", lambda *_, **__: _gone())
+
+    with pytest.raises(gateway_client.GatewayClientError, match="owner silent for 180s"):
+        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
 
 
 class _Attached(Exception):
