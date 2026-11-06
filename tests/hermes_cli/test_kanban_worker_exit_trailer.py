@@ -50,12 +50,13 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
 
 @pytest.mark.parametrize(
     "rc, event, failure_counted",
-    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False)],
+    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False),
+     (kb.KANBAN_OWNER_LOST_EXIT_CODE, "worker_owner_lost", False)],
 )
 def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, failure_counted):
     """Empty reap registry + exit trailer in the log: a clean exit is the protocol violation
-    (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue — not a bare
-    ``pid N not alive`` crash that counts a failure."""
+    (marker, streak, no unified-budget hit), a 75 is a rate-limit requeue and a 76 an
+    owner-lost requeue — none a bare ``pid N not alive`` crash that counts a failure."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="a")
         _dead_worker_with_log(conn, tid, 70001, rc)
@@ -79,8 +80,31 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
             assert kb._json_dict(run["metadata"]).get("protocol_violation") is True
             assert kbd._protocol_violation_streak(conn, tid) == 1
             assert KANBAN_WORKER_EXIT_TRAILER not in (run["error"] or "")
+        elif rc == kb.KANBAN_OWNER_LOST_EXIT_CODE:
+            # The restart's silence is the host's, not the card's: side-channeled for the
+            # dispatch summary, and the retry worker sees the restart, not a failure.
+            assert run["outcome"] == "owner_lost"
+            assert getattr(kbd.detect_crashed_workers, "_last_owner_lost", []) == [tid]
+            assert "owner wait" in (task.last_failure_error or "")
         else:
             assert run["outcome"] == "rate_limited"
+
+
+def test_the_worker_exits_owner_lost_on_its_give_up(monkeypatch, tmp_path, capsys):
+    """``_submit`` turns the wait budget's give-up into ``KANBAN_OWNER_LOST_EXIT_CODE`` —
+    the clean release the sweep requeues without a failure, not a crash."""
+    from hermes_cli import kanban_worker_client as kwc
+
+    async def _silent(*_, **__):
+        raise kwc.KanbanOwnerSilent("Kanban owner silent for 601s: Gateway draining: restart_wait")
+    monkeypatch.setattr(kwc, "run", _silent)
+    for key, value in (("HERMES_KANBAN_BOARD", "b"), ("HERMES_KANBAN_TASK", "t1"),
+                       ("HERMES_KANBAN_RUN_ID", "7"), ("HERMES_KANBAN_CLAIM_LOCK", "h:w1"),
+                       ("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))):
+        monkeypatch.setenv(key, value)
+
+    assert kwc._submit() == kb.KANBAN_OWNER_LOST_EXIT_CODE
+    assert "Kanban owner lost" in capsys.readouterr().err
 
 
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):

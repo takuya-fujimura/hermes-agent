@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Optional
 
+from hermes_cli.gateway_client import GatewayClientError
+
 # A worker that loses its owner (a dropped socket, a restart, `hermes update` draining it or a new
 # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
@@ -39,6 +41,11 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
                                       'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
+
+
+class KanbanOwnerSilent(GatewayClientError):
+    """The wait budget expired: the owner never answered again. The dispatcher reads the
+    exit code as a clean release — the silence was the host's, not the card's."""
 
 
 def admission_answer_budget():
@@ -103,7 +110,7 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                raise KanbanOwnerSilent(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -211,6 +218,12 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except KanbanOwnerSilent as exc:
+        # The give-up is a clean release, not a crash: the dispatcher requeues
+        # the attempt without a failure strike (KANBAN_OWNER_LOST_EXIT_CODE).
+        print(f'Kanban owner lost: {exc}', file=sys.stderr)
+        from hermes_cli.kanban_db import KANBAN_OWNER_LOST_EXIT_CODE
+        return KANBAN_OWNER_LOST_EXIT_CODE
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
