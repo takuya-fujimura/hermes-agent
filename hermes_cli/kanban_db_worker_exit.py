@@ -12,17 +12,22 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli import kanban_db as _kb
-from hermes_cli.kanban_db import (
-    KANBAN_OWNER_LOST_EXIT_CODE,
-    KANBAN_RATE_LIMIT_EXIT_CODE,
-    KANBAN_TERMINAL_PROVIDER_EXIT_CODE,
-)
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+
+# ``kanban_db`` is imported inside the functions below, never at module scope:
+# ``kanban_db`` late-imports ``kanban_db_dispatch``, which top-imports this
+# module — a module-level import here re-creates that cycle and breaks every
+# entry order but kb-first.
 
 
 def _exit_code_kind(code: int) -> tuple[str, int]:
     """``(kind, code)`` for a worker's exit code, however it was observed."""
+    from hermes_cli.kanban_db import (
+        KANBAN_OWNER_LOST_EXIT_CODE,
+        KANBAN_RATE_LIMIT_EXIT_CODE,
+        KANBAN_TERMINAL_PROVIDER_EXIT_CODE,
+    )
+
     if code == 0:
         return ("clean_exit", 0)
     if code == KANBAN_RATE_LIMIT_EXIT_CODE:
@@ -47,6 +52,9 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     or not the process running this sweep ever reaped the worker. Last trailer
     wins — the log is append-mode across re-runs.
     """
+
+    from hermes_cli import kanban_db as _kb
+
     try:
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
