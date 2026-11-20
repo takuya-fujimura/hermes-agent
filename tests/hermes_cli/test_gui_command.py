@@ -1675,6 +1675,74 @@ def test_stop_desktop_processes_locking_build_posix_swap_bypasses_early_return(t
     assert main_desktop._stop_desktop_processes_locking_build(desktop_dir, also_posix=True) == [100]
 
 
+class _FakeChromiumProc:
+    """A release-tree process; Chromium helpers carry --type= in their cmdline."""
+
+    def __init__(self, pid, exe, *, helper=False, log=None):
+        cmdline = [exe, "--type=gpu-process"] if helper else [exe, "--no-sandbox"]
+        self.info = {"pid": pid, "exe": exe, "cmdline": cmdline}
+        self.pid = pid
+        self._log = log if log is not None else []
+
+    def terminate(self):
+        self._log.append(("terminate", self.pid))
+
+    def kill(self):
+        self._log.append(("kill", self.pid))
+
+
+def _stop_with_chromium_tree(tmp_path, monkeypatch, *, survivors):
+    root = _make_desktop_tree(tmp_path)
+    desktop_dir = root / "apps" / "desktop"
+    live_exe = desktop_dir / "release" / _packaged_exe_rel()
+    live_exe.parent.mkdir(parents=True)
+    live_exe.write_text("old", encoding="utf-8")
+    log = []
+    exe = str(live_exe)
+    # Helpers listed before their main, as /proc order can have it.
+    zygote = _FakeChromiumProc(101, exe, helper=True, log=log)
+    gpu = _FakeChromiumProc(102, exe, helper=True, log=log)
+    main = _FakeChromiumProc(100, exe, log=log)
+    procs = [zygote, gpu, main]
+
+    class _FakePsutil:
+        @staticmethod
+        def process_iter(attrs):
+            return procs
+
+        @staticmethod
+        def wait_procs(victims, timeout=5):
+            alive = [p for p in victims if p.pid in survivors]
+            return [p for p in victims if p not in alive], alive
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    stopped = main_desktop._stop_desktop_processes_locking_build(desktop_dir, also_posix=True)
+    return stopped, log
+
+
+@pytest.mark.platforms("posix")
+def test_posix_swap_signals_only_the_main_process_not_chromium_helpers(tmp_path, monkeypatch):
+    """Stopping the zygote / GPU / network helpers together with the browser process
+    makes it try to restart them, fail (error_code=1002) and abort with "GPU process
+    isn't usable" (SIGTRAP + core dump on every update). Helpers exit with their main."""
+    stopped, log = _stop_with_chromium_tree(tmp_path, monkeypatch, survivors=set())
+
+    assert stopped == [100]
+    assert log == [("terminate", 100)]
+
+
+@pytest.mark.platforms("posix")
+def test_posix_swap_escalation_kills_the_main_process_before_its_helpers(tmp_path, monkeypatch):
+    """Anything still alive after the grace period is killed, but never a helper
+    while its main process is still running (that repeats the abort above)."""
+    stopped, log = _stop_with_chromium_tree(tmp_path, monkeypatch, survivors={100, 101, 102})
+
+    assert stopped == [100]
+    kills = [pid for action, pid in log if action == "kill"]
+    assert kills[0] == 100
+    assert sorted(kills) == [100, 101, 102]
+
+
 def _stop_spares_the_desktop_driving_this_update(tmp_path, monkeypatch, *, also_posix):
     """A Desktop's own process tree runs this update (a historical Desktop's piped
     `hermes update` child, or the launch-time tail its backend runs). Stopping that
