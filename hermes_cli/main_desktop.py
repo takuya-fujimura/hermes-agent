@@ -559,7 +559,7 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path, *, also_posix: bool
             spared.update(child.pid for child in parent.children(recursive=True))
     victims = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe"])
+        proc_iter = psutil.process_iter(["pid", "exe", "cmdline"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -575,8 +575,18 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path, *, also_posix: bool
         if release_dir in exe_path.parents:
             victims.append(proc)
 
+    # POSIX: signal only each app's MAIN process; its Chromium helpers (--type=)
+    # exit with it. Stopping them together makes the still-live browser process
+    # fail to relaunch its GPU helper and abort (SIGTRAP + core dump). Survivors
+    # are killed below, main first. Windows: every process holding the exe stops.
+    def _is_root(proc) -> bool:
+        cmd = proc.info.get("cmdline") or []
+        return sys.platform == "win32" or not any(str(a).startswith("--type=") for a in cmd)
+
     stopped: list[int] = []
     for proc in victims:
+        if not _is_root(proc):
+            continue
         try:
             proc.terminate()
             stopped.append(int(proc.pid))
@@ -587,7 +597,7 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path, *, also_posix: bool
         with contextlib.suppress(Exception):
             _, alive = psutil.wait_procs(victims, timeout=5)
             killed = []
-            for proc in alive:
+            for proc in sorted(alive, key=lambda p: not _is_root(p)):
                 try:
                     proc.kill()
                     killed.append(proc)
